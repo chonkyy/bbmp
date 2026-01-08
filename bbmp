@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+import curses
+import pygame
+import os
+import time
+import sys
+import random
+import json
+from mutagen.easyid3 import EasyID3
+from mutagen.mp3 import MP3
+
+# --- 1. CONFIG & THEMES ---
+class Config:
+    FILE_PATH = os.path.join(os.path.expanduser("~"), ".bbmp_config.json")
+    
+    THEMES = [
+        "Native (Terminal Default)",
+        "Magma (Warm - Red/Orange)",
+        "Ocean (Cold - Blue/Cyan)",
+        "Lime (Forest - Green)",
+        "Monochrome (High Contrast)"
+    ]
+
+    def __init__(self):
+        self.theme_index = 0
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.FILE_PATH):
+            try:
+                with open(self.FILE_PATH, 'r') as f:
+                    data = json.load(f)
+                    self.theme_index = data.get("theme_index", 0)
+            except: pass
+
+    def save(self):
+        try:
+            with open(self.FILE_PATH, 'w') as f:
+                json.dump({"theme_index": self.theme_index}, f)
+        except: pass
+
+    def next_theme(self):
+        self.theme_index = (self.theme_index + 1) % len(self.THEMES)
+        self.save()
+        self.apply_theme()
+
+    def set_theme(self, index):
+        self.theme_index = index
+        self.save()
+        self.apply_theme()
+
+    def apply_theme(self):
+        try: curses.start_color()
+        except: pass
+        curses.use_default_colors()
+        
+        name = self.THEMES[self.theme_index]
+
+        # --- THEME COLOR DEFINITIONS ---
+        main_col = curses.COLOR_WHITE
+        alt_col = curses.COLOR_WHITE
+
+        if "Native" in name:
+            main_col = curses.COLOR_BLUE
+            alt_col = curses.COLOR_GREEN
+        elif "Magma" in name:
+            main_col = curses.COLOR_RED
+            alt_col = curses.COLOR_YELLOW
+        elif "Ocean" in name:
+            main_col = curses.COLOR_BLUE
+            alt_col = curses.COLOR_CYAN
+        elif "Lime" in name:
+            main_col = curses.COLOR_GREEN
+            alt_col = curses.COLOR_GREEN 
+        elif "Monochrome" in name:
+            main_col = curses.COLOR_WHITE
+            alt_col = curses.COLOR_WHITE
+
+        # --- PAIR ASSIGNMENTS ---
+        curses.init_pair(1, main_col, -1)
+        curses.init_pair(2, alt_col, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, -1)
+        curses.init_pair(5, curses.COLOR_BLACK, main_col)
+
+# --- 2. DATA MODEL ---
+class Track:
+    def __init__(self, path, filename):
+        self.path = path
+        self.filename = filename
+        self.title = filename
+        self.artist = "Unknown Artist"
+        self.album = "Unknown Album"
+        self.duration = 0
+        self._parse_metadata()
+
+    def _parse_metadata(self):
+        try:
+            tags = EasyID3(self.path)
+            if 'title' in tags: self.title = tags['title'][0]
+            if 'artist' in tags: self.artist = tags['artist'][0]
+            if 'album' in tags: self.album = tags['album'][0]
+            return
+        except: pass
+
+        clean_name = self.filename[:-4] if self.filename.endswith(".mp3") else self.filename
+        parts = clean_name.split(" - ")
+        if len(parts) >= 3:
+            self.title = parts[-1]
+            self.artist = parts[-2]
+        elif len(parts) == 2:
+            self.artist = parts[0]
+            self.title = parts[1]
+        else:
+            self.title = clean_name
+
+    def get_duration(self):
+        if self.duration == 0:
+            try:
+                audio = MP3(self.path)
+                self.duration = audio.info.length
+            except: pass
+        return self.duration
+
+class Library:
+    def __init__(self, folder):
+        self.folder = folder
+        self.tracks = []
+        self.scan()
+
+    def scan(self):
+        self.tracks = []
+        if os.path.exists(self.folder):
+            files = sorted([f for f in os.listdir(self.folder) if f.endswith(".mp3")])
+            for f in files:
+                self.tracks.append(Track(os.path.join(self.folder, f), f))
+
+    def search_strict(self, query):
+        query = query.lower()
+        artists = [t for t in self.tracks if t.artist.lower() == query]
+        if artists: return artists, "artist"
+        albums = [t for t in self.tracks if t.album.lower() == query]
+        if albums: return albums, "album"
+        titles = [t for t in self.tracks if t.title.lower() == query]
+        if titles: return titles, "title"
+        return [], None
+
+    def search_fuzzy(self, query):
+        query = query.lower()
+        return [t for t in self.tracks if query in t.title.lower() or query in t.artist.lower()]
+
+# --- 3. AUDIO ENGINE ---
+class AudioPlayer:
+    def __init__(self):
+        pygame.mixer.init()
+        self.queue = []
+        self.index = 0
+        self.current_track = None
+        self.is_paused = False
+        self.volume = 0.5
+        self.start_time = 0
+        self.paused_at = 0
+        pygame.mixer.music.set_volume(self.volume)
+
+    def load_queue(self, tracks, start_index=0):
+        self.queue = tracks
+        self.index = start_index
+        self.play_current()
+
+    def play_current(self):
+        if 0 <= self.index < len(self.queue):
+            self.current_track = self.queue[self.index]
+            try:
+                pygame.mixer.music.load(self.current_track.path)
+                pygame.mixer.music.play()
+                self.is_paused = False
+                self.start_time = time.time()
+                self.current_track.get_duration() 
+            except: pass
+
+    def toggle_pause(self):
+        if not self.current_track: return
+        if self.is_paused:
+            pygame.mixer.music.unpause()
+            self.is_paused = False
+            self.start_time += (time.time() - self.paused_at)
+        else:
+            pygame.mixer.music.pause()
+            self.is_paused = True
+            self.paused_at = time.time()
+
+    def update(self):
+        if self.current_track and not self.is_paused and not pygame.mixer.music.get_busy():
+            self.next()
+
+    def next(self):
+        if self.index < len(self.queue) - 1:
+            self.index += 1
+            self.play_current()
+
+    def prev(self):
+        if self.index > 0:
+            self.index -= 1
+            self.play_current()
+
+    def seek(self, amount):
+        if not self.current_track: return
+        current_pos = self.get_position()
+        new_pos = max(0, min(self.current_track.duration, current_pos + amount))
+        try:
+            pygame.mixer.music.set_pos(new_pos)
+            self.start_time = time.time() - new_pos
+        except: pass
+
+    def change_volume(self, amount):
+        self.volume = max(0.0, min(1.0, self.volume + amount))
+        pygame.mixer.music.set_volume(self.volume)
+
+    def get_position(self):
+        if self.is_paused: return self.paused_at - self.start_time
+        if self.current_track: return time.time() - self.start_time
+        return 0
+
+# --- 4. INTERFACE (VIEW) ---
+class Interface:
+    def __init__(self, stdscr, config):
+        self.stdscr = stdscr
+        self.config = config
+        curses.start_color() 
+        curses.curs_set(0)
+        self.stdscr.timeout(100)
+        self.config.apply_theme()
+
+    def format_time(self, seconds):
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m:02d}:{s:02d}"
+
+    def draw_progress_bar(self, y, x, width, current, total):
+        pct = 0
+        if total > 0: pct = min(current / total, 1.0)
+        
+        time_str = f" {self.format_time(current)} / {self.format_time(total)}"
+        bar_width = width - len(time_str) - 2
+        if bar_width < 5: bar_width = 5
+        
+        o_pos = int(bar_width * pct)
+        if o_pos >= bar_width: o_pos = bar_width - 1
+
+        self.stdscr.addstr(y, x, "[", curses.color_pair(1)) 
+        if o_pos > 0:
+            self.stdscr.addstr(y, x+1, "-"*o_pos, curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addstr(y, x+1+o_pos, "O", curses.color_pair(1) | curses.A_BOLD)
+        rem = bar_width - o_pos - 1
+        if rem > 0:
+            self.stdscr.addstr(y, x+1+o_pos+1, "-"*rem, curses.color_pair(1))
+        self.stdscr.addstr(y, x+1+bar_width, "]" + time_str, curses.color_pair(1))
+
+    def draw_header(self, width, player):
+        track = player.current_track
+        
+        title = track.title if track else "None"
+        artist = track.artist if track else "-"
+        album = track.album if track else "-"
+        
+        limit = 40
+        if len(title) > limit: title = title[:limit-3] + "..."
+        if len(artist) > limit: artist = artist[:limit-3] + "..."
+        if len(album) > limit: album = album[:limit-3] + "..."
+        
+        self.stdscr.addstr(0, 1, "Track:  ", curses.color_pair(1))
+        self.stdscr.addstr(0, 9, title, curses.color_pair(4) | curses.A_BOLD)
+        self.stdscr.addstr(1, 1, "Artist: ", curses.color_pair(1))
+        self.stdscr.addstr(1, 9, artist, curses.color_pair(2))
+        self.stdscr.addstr(2, 1, "Album:  ", curses.color_pair(1))
+        self.stdscr.addstr(2, 9, album, curses.color_pair(2))
+
+        start_x = 55
+        if width > start_x + 20:
+            avail_w = width - start_x - 2
+            total_time = track.duration if track else 0
+            curr_time = player.get_position()
+            self.draw_progress_bar(1, start_x, avail_w, curr_time, total_time)
+            
+            icon = "\u23F8" if player.is_paused else "\u25B6"
+            txt = " PAUSED" if player.is_paused else " PLAYING"
+            color = curses.color_pair(3) if player.is_paused else curses.color_pair(2)
+            
+            status_str = f"{icon}{txt}   Vol: {int(player.volume*100)}%"
+            center_x = start_x + (avail_w // 2) - (len(status_str) // 2)
+            if center_x < start_x: center_x = start_x
+            
+            self.stdscr.addstr(2, center_x, f"{icon}{txt}", color | curses.A_BOLD)
+            self.stdscr.addstr(2, center_x + len(icon)+len(txt), f"   Vol: {int(player.volume*100)}%", curses.color_pair(4))
+
+    def draw_list(self, height, width, tracks, selected_idx, scroll_offset, current_track, view_mode):
+        self.stdscr.addstr(4, 0, "-"*width, curses.color_pair(1))
+        self.stdscr.addstr(4, 2, f" [ {view_mode} ] ", curses.color_pair(1) | curses.A_BOLD)
+
+        w_num, w_t, w_a = 5, int((width-5)*0.4), int((width-5)*0.3)
+        w_alb = width - 5 - w_t - w_a
+        
+        header = f"{'#'.ljust(4)} {'TITLE'.ljust(w_t)} {'ARTIST'.ljust(w_a)} {'ALBUM'.ljust(w_alb)}"
+        self.stdscr.addstr(5, 0, header[:width], curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
+
+        max_rows = height - 7
+        visible = tracks[scroll_offset : scroll_offset + max_rows]
+        
+        for i, t in enumerate(visible):
+            row_y = 6 + i
+            is_sel = (i + scroll_offset == selected_idx)
+            is_playing = (current_track and t.path == current_track.path)
+            
+            s_num = (str(i + scroll_offset + 1) + ".").ljust(4)
+            s_title = t.title[:w_t-2].ljust(w_t)
+            s_artist = t.artist[:w_a-2].ljust(w_a)
+            s_album = t.album[:w_alb-2].ljust(w_alb)
+
+            if is_sel:
+                full_line = f"{s_num} {s_title} {s_artist} {s_album}"
+                try: self.stdscr.addstr(row_y, 0, full_line[:width], curses.color_pair(5) | curses.A_BOLD)
+                except: pass
+            else:
+                if is_playing:
+                    full_line = f"{s_num} {s_title} {s_artist} {s_album}"
+                    try: self.stdscr.addstr(row_y, 0, full_line[:width], curses.color_pair(2) | curses.A_BOLD)
+                    except: pass
+                else:
+                    try:
+                        self.stdscr.addstr(row_y, 0, s_num, curses.color_pair(1)) 
+                        self.stdscr.addstr(row_y, 5, s_title, curses.color_pair(4)) 
+                        self.stdscr.addstr(row_y, 5 + w_t + 1, s_artist, curses.color_pair(2)) 
+                        self.stdscr.addstr(row_y, 5 + w_t + 1 + w_a + 1, s_album, curses.color_pair(2)) 
+                    except: pass
+
+    def draw_footer(self, height, width, search_mode, query, view_mode):
+        if search_mode:
+            self.stdscr.addstr(height-1, 0, f"SEARCH: {query}_", curses.color_pair(1) | curses.A_REVERSE)
+        else:
+            txt = f"[{view_mode}] SPACE:Pause | /:Search | \u2190\u2192:Seek | Shift+\u2190\u2192:Skip | +/-:Vol | v:View | s:Shuffle | x:Quit"
+            try: self.stdscr.addstr(height-1, 0, txt[:width-1], curses.color_pair(4))
+            except: pass
+
+    def draw_theme_menu(self, height, width, selected):
+        box_h, box_w = 10, 40
+        sy, sx = (height//2)-(box_h//2), (width//2)-(box_w//2)
+        for i in range(box_h):
+            self.stdscr.addstr(sy+i, sx, " "*box_w, curses.A_REVERSE)
+        self.stdscr.addstr(sy, sx+12, " SELECT THEME ", curses.A_REVERSE | curses.A_BOLD)
+        for i, name in enumerate(self.config.THEMES):
+            pre = "> " if i == selected else "  "
+            style = curses.A_REVERSE | curses.A_BOLD if i == selected else curses.A_REVERSE
+            self.stdscr.addstr(sy+2+i, sx+2, (pre+name).ljust(box_w-4), style)
+        self.stdscr.addstr(sy+box_h-1, sx+2, "ENTER: Apply | ESC: Cancel", curses.A_REVERSE)
+
+# --- 5. APP CONTROLLER ---
+class App:
+    def __init__(self, stdscr, library, initial_queue=None, initial_song=None):
+        self.stdscr = stdscr
+        self.config = Config()
+        self.library = library
+        self.player = AudioPlayer()
+        self.ui = Interface(stdscr, self.config)
+
+        self.view_mode = "LIBRARY"
+        self.selection = 0
+        self.scroll = 0
+        self.search_mode = False
+        self.search_query = ""
+        self.theme_mode = False
+        self.theme_sel = self.config.theme_index
+
+        if initial_queue and initial_song:
+            self.player.load_queue(initial_queue)
+            try:
+                idx = initial_queue.index(initial_song)
+                self.player.index = idx
+                self.player.play_current()
+                self.view_mode = "QUEUE"
+            except: pass
+        elif initial_queue:
+             self.player.load_queue(initial_queue)
+             self.view_mode = "QUEUE"
+
+    def get_visible_list(self):
+        if self.view_mode == "QUEUE": return self.player.queue
+        if self.search_query and not self.search_mode:
+            return self.library.search_fuzzy(self.search_query)
+        return self.library.tracks
+
+    def run(self):
+        while True:
+            self.stdscr.erase()
+            h, w = self.stdscr.getmaxyx()
+            self.player.update()
+
+            visible = self.get_visible_list()
+
+            self.ui.draw_header(w, self.player)
+            self.ui.draw_list(h, w, visible, self.selection, self.scroll, self.player.current_track, self.view_mode)
+            self.ui.draw_footer(h, w, self.search_mode, self.search_query, self.view_mode)
+            
+            if self.theme_mode:
+                self.ui.draw_theme_menu(h, w, self.theme_sel)
+
+            self.stdscr.refresh()
+
+            try: key = self.stdscr.getch()
+            except: key = -1
+
+            if key == -1: continue
+
+            if self.theme_mode:
+                if key == 27: self.theme_mode = False
+                elif key == curses.KEY_UP: self.theme_sel = max(0, self.theme_sel - 1)
+                elif key == curses.KEY_DOWN: self.theme_sel = min(len(self.config.THEMES)-1, self.theme_sel + 1)
+                elif key == 10: 
+                    self.config.set_theme(self.theme_sel)
+                    self.ui = Interface(self.stdscr, self.config)
+                    self.theme_mode = False
+            
+            elif self.search_mode:
+                if key == 10:
+                    # FIX: Confirm Search only (Do NOT Play)
+                    self.search_mode = False
+                    self.selection = 0
+                    self.scroll = 0
+                elif key == 27: 
+                    self.search_mode = False; self.search_query = ""
+                elif key == 127 or key == 263:
+                    self.search_query = self.search_query[:-1]
+                elif 32 <= key <= 126:
+                    self.search_query += chr(key)
+                    self.selection = 0; self.scroll = 0
+
+            else:
+                if key == ord('x'): break
+                elif key == ord(' '): self.player.toggle_pause()
+                elif key == ord('s'): 
+                    if self.player.current_track:
+                        others = [t for t in self.library.tracks if t != self.player.current_track]
+                        random.shuffle(others)
+                        self.player.queue = [self.player.current_track] + others
+                        self.player.index = 0
+                    else:
+                        q = self.library.tracks[:]
+                        random.shuffle(q)
+                        self.player.load_queue(q)
+                elif key == ord('v'):
+                    self.view_mode = "QUEUE" if self.view_mode == "LIBRARY" else "LIBRARY"
+                    self.selection = 0; self.scroll = 0
+                elif key == ord('/'): self.search_mode = True; self.search_query = ""
+                elif key == ord('T'): self.theme_mode = True; self.theme_sel = self.config.theme_index
+                elif key == curses.KEY_DOWN or key == ord('j'):
+                    if self.selection < len(visible) - 1:
+                        self.selection += 1
+                        if self.selection >= self.scroll + (h - 8): self.scroll += 1
+                elif key == curses.KEY_UP or key == ord('k'):
+                    if self.selection > 0:
+                        self.selection -= 1
+                        if self.selection < self.scroll: self.scroll = self.selection
+                # --- SEEK CONTROLS ---
+                elif key == curses.KEY_RIGHT: self.player.seek(5)
+                elif key == curses.KEY_LEFT: self.player.seek(-5)
+                # --- SKIP CONTROLS (Shift + Arrow) ---
+                elif key == curses.KEY_SRIGHT: self.player.next()
+                elif key == curses.KEY_SLEFT: self.player.prev()
+                # --- VOLUME CONTROLS ---
+                elif key == ord('+') or key == ord('='): self.player.change_volume(0.1)
+                elif key == ord('-'): self.player.change_volume(-0.1)
+                elif key == 10: 
+                    if visible:
+                        t = visible[self.selection]
+                        if self.view_mode == "QUEUE":
+                            self.player.index = self.selection
+                            self.player.play_current()
+                        else:
+                            self.player.load_queue(visible[self.selection:])
+
+# --- 6. ENTRY POINT ---
+if __name__ == "__main__":
+    folder = os.path.join(os.path.expanduser("~"), "Music")
+    query = None
+
+    if len(sys.argv) > 1:
+        if os.path.isdir(sys.argv[1]): folder = sys.argv[1]
+        else: query = " ".join(sys.argv[1:]).lower()
+
+    try:
+        lib = Library(folder)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    if not lib.tracks:
+        print("Library is empty.")
+        sys.exit(1)
+
+    q = None
+    s = None
+
+    if query:
+        matches, mode = lib.search_strict(query)
+        if not matches:
+            print(f"No artist, album, or title found for '{query}'")
+            sys.exit(1)
+            
+        if mode == "artist" or mode == "album":
+            q = matches[:]
+            random.shuffle(q)
+            s = q[0]
+        elif mode == "title":
+            s = matches[0]
+            others = [t for t in lib.tracks if t.artist == s.artist and t != s]
+            random.shuffle(others)
+            q = [s] + others
+
+    try:
+        curses.wrapper(lambda stdscr: App(stdscr, lib, q, s).run())
+    except KeyboardInterrupt:
+        pass
