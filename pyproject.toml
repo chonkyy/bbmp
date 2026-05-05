@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bbmp"
+version = "0.2.0"
+description = "A minimal TUI music player for MP3 and FLAC files"
+requires-python = ">=3.11"
+dependencies = [
+    "pygame>=2.5.0,<3.0",
+    "mutagen>=1.47.0,<2.0",
+]
+
+[project.scripts]
+bbmp = "bbmp:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
